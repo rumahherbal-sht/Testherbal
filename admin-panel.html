@@ -600,7 +600,9 @@
 
 <!-- ==================== JAVASCRIPT ==================== -->
 <script>
-    // FIREBASE INIT
+    // =====================================================
+    //  FIREBASE INIT
+    // =====================================================
     const firebaseConfig = {
         apiKey: "AIzaSyD1xADf6KbttaSRl3bYuKEMUrQ4SJmTtH4",
         authDomain: "jamu-herbal-alami.firebaseapp.com",
@@ -610,15 +612,23 @@
         messagingSenderId: "770031966685",
         appId: "1:770031966685:web:dc20683776e310c0b0fe34"
     };
-    try { firebase.initializeApp(firebaseConfig); } catch(e) {}
-    const db = firebase.database();
+    try { firebase.initializeApp(firebaseConfig); } catch(e) { console.error('Firebase init error', e); }
+    const db   = firebase.database();
     const auth = firebase.auth();
 
     // GLOBALS
-    const ADMIN_EMAIL = "admin@jamuherbal.com"; // Ubah sesuai email admin
     const EXPIRY_TIME = 10 * 60 * 1000;
     let allPesanan = [];
     let OWNER_WA = "6285187980564";
+    let currentAdminUser = null;
+
+    // =====================================================
+    //  SECURITY: Page is invisible by default
+    //  Only shown after role=admin confirmed from Firebase
+    // =====================================================
+    document.getElementById('loginScreen').style.display = 'flex';
+    // Make sure main content is not accessible in DOM visually
+    document.querySelectorAll('.sidebar, .main').forEach(el => el.style.visibility = 'hidden');
 
     // ===== UTILITY =====
     function showToast(msg, type = 'success') {
@@ -655,41 +665,90 @@
         if(el) el.textContent = new Date().toLocaleString('id-ID', {weekday:'short',hour:'2-digit',minute:'2-digit'});
     }, 1000);
 
-    // ===== AUTH ADMIN =====
-    auth.onAuthStateChanged(user => {
-        if(user) {
-            // Check if admin role
-            db.ref('users/' + user.uid + '/role').once('value').then(snap => {
-                const role = snap.val();
-                if(role === 'admin' || user.email === ADMIN_EMAIL) {
-                    document.getElementById('loginScreen').style.display = 'none';
-                    const name = user.displayName || user.email.split('@')[0];
-                    document.getElementById('topbarName').textContent = name;
-                    document.getElementById('topbarAvatar').textContent = name.charAt(0).toUpperCase();
-                    initAdmin();
-                } else {
-                    auth.signOut();
-                    showAdminError('Akun ini tidak memiliki akses admin.');
-                }
-            });
-        } else {
-            document.getElementById('loginScreen').style.display = 'flex';
+    // =====================================================
+    //  AUTH ADMIN — STRICT ROLE CHECK
+    //  Only role === 'admin' in Firebase DB can enter.
+    //  Email fallback is removed for security.
+    // =====================================================
+    auth.onAuthStateChanged(async user => {
+        if (!user) {
+            // Not logged in → show login screen
+            lockAdmin();
+            return;
+        }
+
+        // User logged in → verify role from Firebase Realtime DB
+        try {
+            const snap = await db.ref('users/' + user.uid + '/role').once('value');
+            const role = snap.val();
+
+            if (role === 'admin') {
+                // ✅ GRANTED
+                currentAdminUser = user;
+                grantAdminAccess(user);
+            } else {
+                // ❌ DENIED — sign out silently and show error
+                await auth.signOut();
+                lockAdmin();
+                showAdminError('⛔ Akses ditolak. Akun ini tidak memiliki hak admin.');
+            }
+        } catch(err) {
+            await auth.signOut();
+            lockAdmin();
+            showAdminError('❌ Gagal memverifikasi akses: ' + err.message);
         }
     });
 
+    function grantAdminAccess(user) {
+        // Hide login, reveal admin UI
+        document.getElementById('loginScreen').style.display = 'none';
+        document.querySelectorAll('.sidebar, .main').forEach(el => el.style.visibility = 'visible');
+
+        const name = user.displayName || user.email.split('@')[0];
+        document.getElementById('topbarName').textContent = name;
+        document.getElementById('topbarAvatar').textContent = name.charAt(0).toUpperCase();
+
+        // Log access
+        db.ref('admin_log').push({
+            uid: user.uid,
+            email: user.email,
+            action: 'LOGIN',
+            timestamp: Date.now(),
+            ua: navigator.userAgent.substring(0, 100)
+        });
+
+        initAdmin();
+    }
+
+    function lockAdmin() {
+        document.getElementById('loginScreen').style.display = 'flex';
+        document.querySelectorAll('.sidebar, .main').forEach(el => el.style.visibility = 'hidden');
+        currentAdminUser = null;
+    }
+
     async function doAdminLogin() {
         const email = document.getElementById('adminEmail').value.trim();
-        const pass = document.getElementById('adminPass').value;
-        const btn = document.getElementById('btnAdminLogin');
-        if(!email || !pass) { showAdminError('Email dan password wajib diisi!'); return; }
+        const pass  = document.getElementById('adminPass').value;
+        const btn   = document.getElementById('btnAdminLogin');
+        const errEl = document.getElementById('adminLoginError');
+        errEl.style.display = 'none';
+
+        if (!email || !pass) { showAdminError('Email dan password wajib diisi!'); return; }
 
         btn.disabled = true;
-        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Masuk...';
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Memverifikasi...';
 
         try {
             await auth.signInWithEmailAndPassword(email, pass);
+            // onAuthStateChanged will handle role check
         } catch(err) {
-            const msgs = { 'auth/wrong-password':'Password salah','auth/user-not-found':'Email tidak terdaftar','auth/invalid-credential':'Email atau password salah' };
+            const msgs = {
+                'auth/wrong-password': 'Password salah',
+                'auth/user-not-found': 'Email tidak terdaftar',
+                'auth/invalid-email': 'Format email tidak valid',
+                'auth/too-many-requests': 'Terlalu banyak percobaan. Coba lagi nanti.',
+                'auth/invalid-credential': 'Email atau password salah'
+            };
             showAdminError(msgs[err.code] || err.message);
             btn.disabled = false;
             btn.innerHTML = '<i class="fas fa-shield-halved"></i> Masuk ke Admin Panel';
@@ -703,7 +762,17 @@
     }
 
     async function doAdminLogout() {
+        if (currentAdminUser) {
+            await db.ref('admin_log').push({
+                uid: currentAdminUser.uid,
+                email: currentAdminUser.email,
+                action: 'LOGOUT',
+                timestamp: Date.now()
+            });
+        }
         await auth.signOut();
+        lockAdmin();
+        showToast('👋 Berhasil keluar dari admin panel', 'info');
     }
 
     // ===== INIT ADMIN =====
